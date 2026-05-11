@@ -1,9 +1,3 @@
----
-editor_options: 
-  markdown: 
-    wrap: sentence
----
-
 # The Illusion of a Monolithic Creole: The Role of Race in the Singlish Network Lexicon
 
 **Author:** Elise Lim Jia Jing\
