@@ -1,0 +1,954 @@
+---
+title: "The Illusion of a Monolithic Creole: The Role of Race in the Singlish Network Lexicon"
+author: "Elise Lim"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: paper
+    df_print: default
+---
+
+# Setup and Libraries
+
+All packages used in the analysis are loaded here.
+
+```{r setup, include=FALSE}
+
+# Set global chunk options
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, include = TRUE)
+options(tibble.print_max = Inf, tibble.width = Inf)
+
+# Load libraries
+library(knitr)
+library(yaml)
+library(tidyverse)
+library(tidytext)
+library(igraph)
+library(stringr)
+library(ggplot2)
+library(ggrepel)
+
+set.seed(4246) 
+
+```
+
+# Data Import
+
+```{r}
+
+# Read raw data
+responses <- read.csv('../data/cleaned_responses_long.csv', row.names = 1) |>
+  mutate(cue = tolower(cue), # convert all responses to lower case letters
+         R1 = str_to_lower(iconv(R1, to = "UTF-8", sub = "")),
+         R2 = str_to_lower(iconv(R2, to = "UTF-8", sub = "")),
+         R3 = str_to_lower(iconv(R3, to = "UTF-8", sub = ""))
+  )
+  
+participants <- read.csv('../data/participant_information.csv')
+
+merged <- left_join(responses, participants, by = 'ResponseId') 
+
+# add R2 and R3 as unique rows as well
+merged_long <- merged |>
+  pivot_longer(cols = c(R1, R2, R3), names_to = "response.round", values_to = "response") |>
+  filter(!is.na(response) & response != "") |> 
+  filter(str_length(str_trim(response)) > 1) |>
+  distinct(ResponseId, cue, response, .keep_all = TRUE)
+
+cue_list <- read.csv("../data/wiki_300_cue_list.csv", row.names = 1)
+
+```
+
+# Data Pre-processing
+
+## Participant Exclusion
+
+### Birth and Residence in Singapore
+
+```{r}
+# Count of participants who resided and were born in Singapore
+merged_long %>% 
+  distinct(ResponseId, Country.Residence, Country.Birth) %>% 
+  count(Country.Residence, Country.Birth)
+
+```
+
+Since I am focusing on the network of Singlish lexicon, I will focus on Singaporeans who were born in and reside in Singapore. Hence, I will exclude participants whose birth country or country of residence is not Singapore.
+
+```{r}
+df <- merged_long %>% 
+  filter(
+    `Country.Birth` %in% c("Singapore") & 
+    `Country.Residence` %in% c("Singapore")
+  )
+```
+
+### Race
+
+```{r}
+# Count of participants from each race who was born and resided in Singapore
+df %>% distinct(ResponseId, Race, Race_4_TEXT) %>% count(Race, Race_4_TEXT)
+```
+
+Since the races in 'Other' category have too small a sample size to draw meaningful conclusions, I will focus on the three larger races in Singapore: Chinese, Malay and Indians.
+
+There are too many Chinese groups compared to the other races. For my research question, I will randomly sample Chinese participants results until the quality of yield is the same (ie. same number of associations as Malays and Indians). This allows for a similar percentage of each demographic represented. This downsampling will be conducted below.
+
+```{r}
+df <- df %>% 
+  filter(`Race` %in% c("Chinese", 'Malay', 'Indian')) %>% 
+  
+  # move cue words and responses to front
+  relocate(cue, response)
+```
+
+## Response Level Cleaning
+
+Data was cleaned following a procedure similar to the one used by the original Small World of Words project (De Deyne et al., 2019).
+
+```{r}
+df2 <- df %>% 
+  
+  # remove canonical forms, definite and indefinite articles ()
+  mutate(
+    response_clean = str_replace_all(response, "(?i)\\b(a|an|the|to)\\b", ""),
+    response_clean = str_squish(response_clean)
+  ) %>% 
+  
+  # remove empty rows that become empty after cleaning
+  filter(response_clean!= "" & !is.na(response_clean)) %>% 
+  
+  # remove responses that is the same as cue word
+  filter(cue != response_clean) %>% 
+  
+  mutate(response = response_clean)
+
+# to see the cue-response pairs that are removed
+# df %>% anti_join(df2, by = c("ResponseId", "cue", "response.round")) %>%  select(cue, response)
+
+num_rows_removed <- nrow(df) - nrow(df2)
+print(paste("Total rows removed:", num_rows_removed))
+print(paste("Percentage of responses removed:", round(num_rows_removed / nrow(df) * 100,3), "%"))
+```
+
+When participants were unsure about cue words, they should leave it blank. Yet, there were some participants who responded with "don't know", "not sure" or "no idea". Some cue words have this meaning (eg. catch no ball), so I checked if multiple people gave the same target phrase to a specific cue. If so, the target phrase might be a legitimate colloquial association rather than just someone skipping the question.
+
+```{r}
+target_phrases <- c("don't know", "dont know", "not sure", "no idea")
+
+df_with_counts <- df2 %>%
+  group_by(cue, response) %>% 
+  mutate(response_freq = n()) %>%
+  ungroup()
+
+# kept only the rows where the response is a target phrase AND it only appeared once (n == 1)
+excluded_phrases <- df_with_counts %>%
+  filter(response %in% target_phrases & response_freq == 1) %>%
+  select(-response_freq)
+
+# Keep the rows that are NOT the excluded phrases
+df3 <- df2 %>% anti_join(excluded_phrases, by = c("ResponseId", "cue", "response"))
+
+print(paste("Rows excluded:", nrow(excluded_phrases)))
+print(paste("Percentage of rows excluded:", round(nrow(excluded_phrases) / nrow(df2) * 100, 3), "%"))
+print(paste("Rows remaining in df3:", nrow(df3)))
+
+# cue words that were kept because multiple people said these target phrases
+kept_targets <- df3 %>%
+  filter(tolower(response) %in% target_phrases) %>%
+  select(cue, response) %>%
+  distinct()
+
+kable(kept_targets, caption = "Kept Target Phrases (since more than one person said them for the same cue")
+```
+
+### Investigating removal of N-grams
+
+De Deyne et al. (2019) excluded participants where more than 30% of responses were multi-word responses (more than one word). This was to filter out participants who may have misunderstood the task and gave long definitions instead of single word associations.
+
+To see how much data I would lose if I were to adopt this exclusion criteria, I will first calculate the percentage of responses that are multi-word responses (n \> 1). Then, I will apply the exclusion criteria and calculate the exact percentage of data lost.
+
+```{r}
+total_responses <- nrow(df3)
+initial_response_count <- total_responses
+
+# count responses with more than one word
+ngram_count <- df3 %>%
+  filter(str_count(response, "\\w+") > 1) %>%
+  nrow()
+
+# calculate percentage
+percentage_removed <- (ngram_count / total_responses) * 100
+
+print(paste("Total responses in df3:", total_responses))
+print(paste("Number of multi-word responses (n > 1):", ngram_count))
+print(paste("Percentage of multi-word responses:", round(percentage_removed, 2), "%"))
+```
+
+A substantial percentage of 32.49% responses are multi-word responses.
+
+```{r keep only one word response participants}
+df3_with_ngrams <- df3 %>%
+  mutate(
+    word_count = str_count(str_squish(response), "\\w+"),
+    is_ngram = word_count > 1 # gives true/false
+  )
+
+# Calculate participant level statistics
+participant_stats <- df3_with_ngrams %>%
+  group_by(ResponseId, Race) %>% 
+  summarise(
+    total_responses = n(),
+    # Proportion of responses that are n-grams (n > 1)
+    prop_ngrams = mean(is_ngram, na.rm = TRUE),
+    .groups = "drop_last"
+  )
+
+# Apply the De Deyne et al. (2019) criteria
+valid_participants <- participant_stats %>%
+  filter(
+    prop_ngrams <= 0.30,  # Exclude if MORE than 30% are n-grams
+  )
+
+# Filtered dataset
+final_filtered_df <- df3_with_ngrams %>%
+  filter(ResponseId %in% valid_participants$ResponseId) %>%
+  select(-word_count, -is_ngram)
+
+# calculate exact loss
+final_response_count <- nrow(final_filtered_df)
+responses_lost <- initial_response_count - final_response_count
+percentage_lost <- (responses_lost / initial_response_count) * 100
+
+exclusion_summary <- tibble(
+  Metric = c("Initial total responses", 
+             "Total responses lost", 
+             "Responses remaining", 
+             "Percentage of dataset lost", 
+             "Participants dropped"),
+  Value = c(as.character(total_responses), 
+            as.character(responses_lost), 
+            as.character(final_response_count), 
+            paste0(round(percentage_lost, 2), "%"), 
+            as.character(nrow(participant_stats) - nrow(valid_participants)))
+)
+
+# Render a pretty table
+kable(exclusion_summary, 
+      col.names = c("Exclusion Summary", "Count/Value"),
+      caption = "Exclusion Summary for Unigrams Only (De Deyne et al., 2019 Criteria)")
+```
+
+If I followed De Deyne et al.'s exclusion criteria on excluding participants with more than 30% multi-word responses, I would have lost a significant 53.9% data. Hence, I will not adopt their method of exclusion.
+
+However, given that many Singlish words are phrasal, this one-word threshold may be too restrictive. Hence, I will also check the percentage of responses that are more than 2 words, and apply the same exclusion criteria to see how much data I would lose.
+
+```{r keep only one/two word response participants}
+df3_with_ngrams <- df3 %>%
+  mutate(
+    word_count = str_count(str_squish(response), "\\w+"),
+    is_ngram = word_count > 2 # gives true/false
+  )
+
+# Calculate participant level statistics
+participant_stats <- df3_with_ngrams %>%
+  group_by(ResponseId, Race) %>% 
+  summarise(
+    total_responses = n(),
+    
+    # N-gram proportion (> 30% of responses are 3+ words)
+    prop_ngrams = mean(is_ngram, na.rm = TRUE),
+    
+    # Proportion of responses that are unique
+    unique_responses = n_distinct(tolower(response), na.rm = TRUE),
+    perc_unique = unique_responses / total_responses,
+  )
+
+# Apply the De Deyne et al. (2019) criteria
+valid_participants <- participant_stats %>%
+  filter(
+    prop_ngrams <= 0.30,  # Exclude if MORE than 30% are n-grams
+  )
+
+# Filtered dataset
+final_filtered_df <- df3_with_ngrams %>%
+  filter(ResponseId %in% valid_participants$ResponseId) %>%
+  select(-word_count, -is_ngram)
+
+# calculate exact loss
+final_response_count <- nrow(final_filtered_df)
+responses_lost <- initial_response_count - final_response_count
+percentage_lost <- (responses_lost / initial_response_count) * 100
+
+exclusion_summary <- tibble(
+  Metric = c("Initial total responses", 
+             "Total responses lost", 
+             "Responses remaining", 
+             "Percentage of dataset lost", 
+             "Participants dropped"),
+  Value = c(as.character(total_responses), 
+            as.character(responses_lost), 
+            as.character(final_response_count), 
+            paste0(round(percentage_lost, 2), "%"), 
+            as.character(nrow(participant_stats) - nrow(valid_participants)))
+)
+
+# Render a pretty table
+kable(exclusion_summary, 
+      col.names = c("Exclusion Summary", "Count/Value"),
+      caption = "Exclusion Summary for Unigrams and Bigrams (De Deyne et al., 2019 Criteria)")
+```
+
+It seems that this two-word threshold is better, with only 32 participants flagged for removal. They only contributed 5.5% of the data. Hence, I will adopt the two-word threshold in participant exclusion and exclude these participants.
+
+### Investigating removal of "spam" participants
+
+Now, I will check for other exclusion criterion as mentioned in De Deyne et al. (2019), that participants are excluded if fewer than 80% of responses were unique. This means that they gave the same response to many different cue words.
+
+```{r checks for other exclusion criterion}
+failed_ngrams <- participant_stats %>% filter(prop_ngrams > 0.30)
+failed_rep    <- participant_stats %>% filter(perc_unique < 0.80)
+
+kable(failed_rep, caption = "Demographics: Failed <80% Uniqueness Check")
+```
+
+```{r investigating spam participants}
+
+repetitive_audit <- df3_with_ngrams %>%
+  filter(ResponseId %in% failed_rep$ResponseId) %>%
+  
+  # Count how many times each participant used each word
+  group_by(ResponseId, Race) %>%
+  count(response, name = "Times_Repeated") %>%
+  arrange(ResponseId, desc(Times_Repeated)) %>%
+  slice_max(order_by = Times_Repeated, n = 3, with_ties = FALSE) %>%
+  ungroup() %>%
+  
+  # Join back to participant_stats to get their total cues and uniqueness score
+  left_join(participant_stats %>% select(ResponseId, total_responses, perc_unique), 
+            by = "ResponseId") %>%
+  
+  mutate(Uniqueness_Score = round(perc_unique, 3)) %>%
+  select(ResponseId, Race, response, Times_Repeated, total_responses, Uniqueness_Score)
+
+kable(repetitive_audit, caption = "Top Repeated Words by Excluded Participants (<80% Unique)")
+```
+
+While De Deyne et al. (2019) recommend excluding participants whose responses are less than 80% unique to prevent 'spam' behavior, a qualitative analysis of the repeated words reveal that these participants are not necessarily spamming. For example, one participant repeated "bad" 9 times, but this is a common Singlish word that can be associated with many different cue words (eg. "pang seh", "geh geh", "rabz"). Hence, I will not exclude these participants.
+
+```{r update df3 dataset}
+df3_old <- df3
+df3 <- df3 %>%
+  filter(!ResponseId %in% failed_ngrams$ResponseId)
+```
+
+### Using a 5-word threshold instead
+
+To eliminate highly descriptive sentences while preserving valid multi-word Singlish phrases, I excluded responses with more than 5 words. A maximum length of five words was specifically selected to accommodate established multi-word target concepts inherent to Singaporean culture (e.g., the 5Cs: cash, car, credit card, condominium, club).
+
+```{r percentage loss for 5-word threshold}
+# number of words in every df
+df_word_counts <- df3 %>%
+  mutate(word_count = str_count(response, "\\w+"))
+
+total_responses <- nrow(df_word_counts)
+
+# calculate for > 5 words
+removed_more_than_5 <- df_word_counts %>% 
+  filter(word_count > 5) %>% 
+  nrow()
+pct_more_than_5 <- (removed_more_than_5 / total_responses) * 100
+
+print(paste("Percentage of responses with MORE than 5 words:", round(pct_more_than_5, 2), "%"))
+```
+
+```{r df4 with 5-word threshold}
+df4 <- df3 %>%  
+  filter(str_count(response, "\\w+") <= 5)
+
+threshold_summary <- tibble(
+  Stage = c("Responses before (df3)", 
+            "Responses after (df4)", 
+            "Total removed"),
+  Count = c(nrow(df3), 
+            nrow(df4), 
+            nrow(df3) - nrow(df4))
+)
+
+kable(threshold_summary, 
+      col.names = c("Data Cleaning Stage", "Response Count"),
+      caption = "Summary of 5-Word Maximum Threshold Cleaning")
+```
+
+# Finalised Dataset
+
+## Full data
+
+```{r}
+final_dataset <- df4
+
+el_full_dataset <- final_dataset %>% 
+  select(cue, response) %>% 
+  count(cue, response) %>% 
+  rename(from = cue, to = response, weight = n)
+
+el_full_byRace <- final_dataset %>% 
+  select(cue, response, Race) %>% 
+  count(cue, response, Race) %>% 
+  rename(from = cue, to = response, weight = n)
+
+#write.csv(final_dataset, "cleaned_final_dataset.csv", row.names=FALSE)
+#write.csv(el_full_byRace, "el_full_byRace.csv", row.names=FALSE)
+```
+
+### Race Distribution
+
+```{r}
+race_counts <- final_dataset %>%
+  group_by(Race) %>%
+  summarise(participant_count = n_distinct(ResponseId), total_responses=n()) %>% 
+  mutate(
+    participant_pct = round((participant_count / sum(participant_count)) * 100, 2),
+    response_pct = round((total_responses / sum(total_responses)) * 100, 2),
+    avg_response_per_participant = round(total_responses / participant_count, 2)
+  ) %>% 
+  select(Race, participant_count, participant_pct, total_responses, response_pct, avg_response_per_participant)
+
+kable(race_counts, caption = "Table 1: Demographic Breakdown of Participants and Valid Semantic Responses")
+```
+
+```{r separate edge lists by race}
+el_full_chinese <- final_dataset %>% filter(Race == "Chinese") %>% 
+  count(cue, response)  %>% rename(from = cue, to = response, weight = n) 
+
+el_full_malay <- final_dataset %>% filter(Race == "Malay") %>% 
+  count(cue, response)  %>% rename(from = cue, to = response, weight = n)
+
+el_full_indian <- final_dataset %>% filter(Race == "Indian") %>% 
+  count(cue, response)  %>% rename(from = cue, to = response, weight = n)
+
+nodes_chinese <- length(unique(c(el_full_chinese$from, el_full_chinese$to)))
+nodes_malay <- length(unique(c(el_full_malay$from, el_full_malay$to)))
+nodes_indian <- length(unique(c(el_full_indian$from, el_full_indian$to)))
+
+network_size_summary <- tibble(
+  Demographic = c("Chinese", "Malay", "Indian"),
+  Nodes = c(nodes_chinese, nodes_malay, nodes_indian),
+  Edges = c(as.numeric(count(el_full_chinese)), 
+            as.numeric(count(el_full_malay)), 
+            as.numeric(count(el_full_indian)))
+)
+
+kable(network_size_summary, 
+      col.names = c("Demographic Group", "Total Nodes", "Total Edges"),
+      caption = "Summary of Full Hybrid Network Size by Race")
+```
+
+Since the demographics representation in the full data set is uneven, I will randomly select Chinese and Malay participants to form the network, until the number of edges roughly matches that of Indian participants. This ensures that the findings obtained of the Singlish lexicon network is due to the differences in demographics, and not the significantly larger quantity of responses. I will do this when examining macro level statistics.
+
+Even though there is an uneven demographics representation, when I examine degree centrality, I will focus on normalised percentile degree ranks. This is independent of density and size of network. Hence, I will continue using the fully cleaned dataset.
+
+# Building a Hybrid Semantic-Syntactic Network
+
+Since I am looking at retrieval and how each race navigates the Singlish lexicon, I will split the responses according to:
+
+1.  Semantic Priming (Cue -\> Each individual word in response): This cue word is now associated with each word concept simultaneously. For example, the cue `o$p$` with response *owe money pay money* now has the following edges: `o$p$` -\> *owe* ; `o$p$` -\> *money* ; `o$p$`-\> *pay*. Note that the `o$p$`-\> *money* edge is counted only once.
+
+2.  Syntactic Chaining (Each word in response-\> Next word in response): Each word in response is related to the next word in response. For example, *owe* -\> *money*; *money* -\> *pay*; *pay* -\> *money*.
+
+```{r --- fn to build hybrid network}
+build_hybrid_network <- function(df, target_race) {
+  df_race <- df %>% 
+    filter(Race == target_race) %>% 
+    mutate(doc_id = row_number())
+  
+  # 1. Get semantic edges (cue -> every word in response)
+  edges_semantic <- df_race %>%
+    # Break response into individual words (unigrams)
+    unnest_tokens(to, response, token = "words") %>%
+    rename(from = cue) %>%
+    select(from, to, ResponseId)
+  
+  # 2. Get Syntactic Edges (word 1 in response -> word 2 in response)
+  edges_syntactic <- df_race %>%
+    # Break response into overlapping bigrams
+    unnest_tokens(bigram, response, token = "ngrams", n = 2) %>%
+    filter(!is.na(bigram)) %>%
+    # Split bigram into 'from' and 'to'
+    separate(bigram, into = c("from", "to"), sep = " ") %>%
+    select(from, to, ResponseId)
+  
+  # 3. Combine and build graph
+  hybrid_edges <- bind_rows(edges_semantic, edges_syntactic) |> 
+    filter(from != to)
+  
+  g <- graph_from_data_frame(hybrid_edges  %>%
+                               count(from, to, name = "weight"), directed = TRUE)
+  
+  df_name <- deparse(substitute(df))
+  assign(paste0("el_hybrid_", target_race), hybrid_edges, envir = .GlobalEnv)
+  
+  # comps <- components(g)
+  # lcc <- induced_subgraph(g, V(g)[comps$membership == which.max(comps$csize)])
+  return(g)
+}
+
+```
+
+```{r build hybrid networks}
+g_chi_hybrid <- build_hybrid_network(final_dataset, "Chinese")
+g_mal_hybrid <- build_hybrid_network(final_dataset, "Malay")
+g_ind_hybrid <- build_hybrid_network(final_dataset, "Indian")
+```
+
+# Global Network Statistics
+
+```{r --- fn to get global stats}
+get_global_stats <- function(original_graph, race) {
+  # Filter out nodes that have 0 edges in this specific demographic
+  active_nodes <- V(original_graph)[degree(original_graph) > 0]
+  active_graph <- induced_subgraph(original_graph, active_nodes)
+  
+  # get LCC
+  net_components <- components(active_graph)
+  num_components <- net_components$no
+  lcc_size <- max(net_components$csize)
+  proportion_lcc <- lcc_size / gorder(active_graph)
+  
+  lcc_id <- which.max(net_components$csize)
+  lcc_graph <- induced_subgraph(active_graph, vids = V(active_graph)[net_components$membership == lcc_id])
+  
+  lcc_aspl <- mean_distance(lcc_graph, directed = TRUE, weights = NA)
+  lcc_diameter <- diameter(lcc_graph, directed = TRUE, weights = NA)
+  lcc_transitivity <- transitivity(lcc_graph, type = "global") 
+  lcc_density <- edge_density(lcc_graph)
+  
+  # Calculate global metrics
+  tibble(
+    Demographic = race,
+    Nodes = gorder(active_graph),
+    Edges = gsize(active_graph),
+    Average_Degree = round(mean(degree(active_graph)), 3),
+    Number_of_Components = components(active_graph)$no,
+    LCC_Size = lcc_size,
+    Proportion_in_LCC = proportion_lcc,
+    ASPL = round(mean_distance(active_graph, directed = TRUE, weights = NULL), 3),
+    Transitivity = round(transitivity(active_graph, type = "global"), 3),
+    Diameter = diameter(active_graph, directed = TRUE, weights=NA, unconnected = TRUE),
+    Global_Density = round(edge_density(active_graph), 5),
+    Assortativity_Degree = assortativity_degree(active_graph, directed = TRUE),
+    Degree_Centralisation = round(centr_degree(active_graph)$centralization, 4),
+    
+    LCC_ASPL = lcc_aspl,
+    LCC_Transitivity = lcc_transitivity,
+    LCC_Diameter = lcc_diameter,
+    LCC_Density = lcc_density
+  )
+}
+```
+
+```{r get global statistics}
+global_comparison_table <- bind_rows(
+  get_global_stats(g_chi_hybrid, "Chinese"),
+  get_global_stats(g_mal_hybrid, "Malay"),
+  get_global_stats(g_ind_hybrid, "Indian")
+)
+
+kable(t(global_comparison_table), caption = "Table 2: Macro Network Statistics of Each Raw Demographic Network")
+```
+
+Since global network statistics (eg. ASPL and global clustering) are sensitive to network size and density, the raw demographic datasets could not be directly compared. As the demographic representation in the full dataset is severely imbalanced, with Chinese network being a lot larger in size due to the much higher quantity of responses, an iterative bootstrapping procedure is deployed. Chinese and Malay datasets will be repeatedly sub sampled at the participant level, until the quality of results (number of total edge counts) approximately matches that of Indian dataset. This random sampling iteration will be conducted 100 times and the resulting macro-level metrics will be averaged across all iterations. This ensures any observed divergence in Singlish macro-structure is driven by fundamental demographic differences rather than statistical artifacts of sample size.
+
+## Sub Sampling
+
+```{r --- fn to random sample at participant level}
+random_sample_hybrid <- function(dataset, target_edge_count) {
+  
+  available_ids <- dataset |> 
+    pull(ResponseId) |> 
+    unique()
+  
+  selected_ids <- c()
+  current_edge_count <- 0
+  
+  while (current_edge_count < target_edge_count && length(available_ids) > 0) {
+    sampled_id <- sample(available_ids, 1) # select one participant randomly
+    selected_ids <- c(selected_ids, sampled_id) # add to pool
+    available_ids <- setdiff(available_ids, sampled_id)
+    
+    # recalculate new total edges
+    temp_el <- dataset |> 
+      filter(ResponseId %in% selected_ids) |> 
+      count(from, to)
+    
+    current_edge_count <- nrow(temp_el)
+  }
+  
+  # give final edge list for this group
+  final_el <- dataset |> 
+    filter(ResponseId %in% selected_ids) |> 
+    count(from, to, name="weight")
+  
+  return(final_el)
+}
+```
+
+```{r random sample to match number of indian edges}
+target_edges <- gsize(g_ind_hybrid)
+
+el_matched_indian <- random_sample_hybrid(el_hybrid_Indian, target_edges)
+el_matched_chinese <- random_sample_hybrid(el_hybrid_Chinese, target_edges)
+el_matched_malay <- random_sample_hybrid(el_hybrid_Malay, target_edges)
+
+print(c(nrow(el_matched_indian), nrow(el_matched_chinese), nrow(el_matched_malay)))
+
+```
+
+Now, I run this iteratively for 100 times to gather average network statistics for each race.
+
+```{r run 100 iterations}
+num_iterations <- 100
+target_edges <- gsize(g_ind_hybrid)
+
+set.seed(4246)
+
+# run a single iteration for a specific demographic
+run_single_boot_iteration <- function(edge_dataset, race_label) {
+  sampled_el <- random_sample_hybrid(edge_dataset, target_edges) # random sample
+  g_sampled <- graph_from_data_frame(sampled_el, directed = TRUE) # build graph
+  stats <- get_global_stats(g_sampled, race_label) # get global stats
+  return(stats)
+}
+
+chinese_boot_list <- lapply(1:num_iterations, function(i) {
+  run_single_boot_iteration(el_hybrid_Chinese, "Chinese (Subsampled)")
+})
+chinese_iterations <- bind_rows(chinese_boot_list) # Combine 100 results
+
+malay_boot_list <- lapply(1:num_iterations, function(i) {
+  run_single_boot_iteration(el_hybrid_Malay, "Malay (Subsampled)")
+})
+malay_iterations <- bind_rows(malay_boot_list) # Combine 100 results
+```
+
+```{r calculate averaged macro staistics}
+averaged_itereated_stats <- bind_rows(chinese_iterations, malay_iterations) %>%
+  group_by(Demographic) %>%
+  summarise(
+    # Overall Graph Metrics
+    Nodes_SD = round(sd(Nodes), 1), Nodes = round(mean(Nodes), 1),
+    Edges_SD = round(sd(Edges), 1), Edges = round(mean(Edges), 1), 
+    Avg_Degree_SD = round(sd(Average_Degree), 3), Average_Degree = round(mean(Average_Degree), 3),
+    Components_SD = round(sd(Number_of_Components), 1), Number_of_Components = round(mean(Number_of_Components), 1),
+    LCC_Size_SD = round(sd(LCC_Size), 1), LCC_Size = round(mean(LCC_Size), 1),
+    Prop_in_LCC_SD = round(sd(Proportion_in_LCC), 4), Proportion_in_LCC = round(mean(Proportion_in_LCC), 4),
+    
+    # Topological Core Metrics
+    ASPL_SD = round(sd(ASPL), 3), ASPL = round(mean(ASPL), 3),
+    Transitivity_SD = round(sd(Transitivity), 3), Transitivity = round(mean(Transitivity), 3),
+    Diameter_SD = round(sd(Diameter), 2), Diameter = round(mean(Diameter), 2),
+    Edge_Density_SD = round(sd(Global_Density), 5), Edge_Density = round(mean(Global_Density), 5),
+    Assortativity_SD = round(sd(Assortativity_Degree, na.rm=TRUE), 3), Assortativity_Degree = round(mean(Assortativity_Degree, na.rm=TRUE), 3),
+    Centralisation_SD = round(sd(Degree_Centralisation), 4), Degree_Centralisation = round(mean(Degree_Centralisation), 4),
+    
+    # LCC Specific Metrics
+    LCC_ASPL_SD = round(sd(LCC_ASPL), 3), LCC_ASPL = round(mean(LCC_ASPL), 3),
+    LCC_Transitivity_SD = round(sd(LCC_Transitivity), 3), LCC_Transitivity = round(mean(LCC_Transitivity), 3),
+    LCC_Diameter_SD = round(sd(LCC_Diameter), 2), LCC_Diameter = round(mean(LCC_Diameter), 2),
+    LCC_Density_SD = round(sd(LCC_Density), 5), LCC_Density = round(mean(LCC_Density), 5)
+  ) %>%
+  
+  # Reorder columns
+  select(Demographic, 
+         Nodes, Nodes_SD, Edges, Edges_SD, Average_Degree, Avg_Degree_SD,
+         Number_of_Components, Components_SD, LCC_Size, LCC_Size_SD, Proportion_in_LCC, Prop_in_LCC_SD,
+         ASPL, ASPL_SD, Transitivity, Transitivity_SD, Diameter, Diameter_SD,
+         Edge_Density, Edge_Density_SD, Assortativity_Degree, Assortativity_SD,
+         Degree_Centralisation, Centralisation_SD, 
+         LCC_ASPL, LCC_ASPL_SD, LCC_Transitivity, LCC_Transitivity_SD, 
+         LCC_Diameter, LCC_Diameter_SD, LCC_Density, LCC_Density_SD)
+
+indian_baseline_stats <- get_global_stats(g_ind_hybrid, "Indian (Baseline)") %>%
+  mutate(Demographic = as.character(Demographic)) 
+
+final_macro_comparison <- bind_rows(averaged_itereated_stats, indian_baseline_stats)
+
+kable(t(final_macro_comparison), caption = "Table 3: Averaged Macro-Level Statistics (100 Iterations)")
+```
+## T-tests
+
+```{r}
+tidy_ttest <- function(test_obj, comparison_name, metric_name) {
+  tibble(
+    Comparison = comparison_name,
+    Metric = metric_name,
+    t = round(test_obj$statistic, 2),
+    df = round(test_obj$parameter, 2),
+    p = format.pval(test_obj$p.value, digits = 3, eps = 0.001),
+    Mean_X = round(test_obj$estimate[1], 3),
+    Mean_Y_or_Mu = ifelse(length(test_obj$estimate) > 1, 
+                          round(test_obj$estimate[2], 3), 
+                          round(test_obj$null.value, 3))
+  )
+}
+
+# Run the tests and store objects
+t_cm_aspl  <- t.test(chinese_iterations$ASPL, malay_iterations$ASPL)
+t_cm_clust <- t.test(chinese_iterations$Transitivity, malay_iterations$Transitivity)
+
+indian_aspl  <- indian_baseline_stats$ASPL[1]
+indian_clust <- indian_baseline_stats$Transitivity[1]
+
+t_ci_aspl  <- t.test(chinese_iterations$ASPL, mu = indian_aspl)
+t_mi_aspl  <- t.test(malay_iterations$ASPL, mu = indian_aspl)
+t_ci_clust <- t.test(chinese_iterations$Transitivity, mu = indian_clust)
+t_mi_clust <- t.test(malay_iterations$Transitivity, mu = indian_clust)
+
+# Combine into one table
+ttest_summary <- bind_rows(
+  tidy_ttest(t_cm_aspl,  "Chinese vs. Malay",  "ASPL"),
+  tidy_ttest(t_cm_clust, "Chinese vs. Malay",  "Clustering"),
+  tidy_ttest(t_ci_aspl,  "Chinese vs. Indian", "ASPL"),
+  tidy_ttest(t_mi_aspl,  "Malay vs. Indian",   "ASPL"),
+  tidy_ttest(t_ci_clust, "Chinese vs. Indian", "Clustering"),
+  tidy_ttest(t_mi_clust, "Malay vs. Indian",   "Clustering")
+)
+
+# Render
+kable(ttest_summary, 
+      col.names = c("Comparison", "Metric", "t-stat", "df", "p-value", "Mean (Group 1)", "Mean (Group 2)"),
+      caption = "Summary of Statistical Comparisons Across Demographics")
+```
+
+# Micro Network Analysis (Degree Centrality)
+
+**Does racial background fundamentally alter the cognitive architecture of the Singlish lexicon?**
+
+To answer this research question, I will examine closely: Degree Centrality
+
+```         
+-   universal hubs
+
+-   distinctive anchors of each group
+```
+
+Since Degree centrality does not rely on the density or size of network, I will use the full data set across each racial group.
+
+## Calculate Degree Centrality Scores (Hubs)
+
+```{r --- fn to get degree centrality scores}
+# Extract top n centrality words (normalised)
+get_top_degree <- function(g, top_n = 20) {
+  deg_scores <- degree(g, normalized = TRUE)
+  sorted_scores <- sort(deg_scores, decreasing = TRUE)
+  
+  return(tibble(
+    Word = names(sorted_scores)[1:top_n],
+    Score = round(as.numeric(sorted_scores)[1:top_n], 4)
+    ))
+}
+```
+
+```{r Degree Centrality Scores}
+# get centrality scores
+deg_chi <- get_top_degree(g_chi_hybrid, 20)
+deg_mal <- get_top_degree(g_mal_hybrid, 20)
+deg_ind <- get_top_degree(g_ind_hybrid, 20)
+
+top20_table <- tibble(
+  Rank = 1:20,
+  Chi_Hubs = deg_chi$Word, Chi_Score = deg_chi$Score,
+  Mal_Hubs = deg_mal$Word, Mal_Score = deg_mal$Score,
+  Ind_Hubs = deg_ind$Word, Ind_Score = deg_ind$Score
+)
+
+kable(top20_table, caption = "Top 20 Degree Centrality Words (Hubs) by Demographic")
+```
+
+## Jaccard Similarity Coefficient Comparison
+
+To quantify the degree of structural similarity between the syntactic networks of different demographic groups, a Jaccard Similarity Coefficient was calculated. For each pairwise demographic comparison (eg. Chinese vs Malay), the Jaccard index measured the overlap between the top 20 highest-degree nodes (these are also the "hub" words).
+
+The Jaccard coefficient is formally defined as the size of the intersection divided by the size of the union of two sample sets:
+
+$$J(A, B) = \frac{|A \cap B|}{|A \cup B|}$$ Note that this analysis was conducted as unweighted set comparison.The Jaccard score is calculated purely based on the distinct vocabulary items present in the top 20 lists, independent of their absolute degree centrality scores or underlying edge weights. This isolates the lexical identity of the cognitive bridges, allowing us to test whether different cultures rely on the same vocabulary to navigate their semantic networks, regardless of individual usage frequency.
+
+```{r --- fn to compare Jaccard Similarity}
+# Jaccard Similarity between two lists
+compare_jaccard <- function(list_A, list_B, group_A, group_B) {
+  shared <- intersect(list_A, list_B)
+  total_unique <- union(list_A, list_B)
+  
+  tibble(
+    Comparison = paste(group_A, "vs", group_B),
+    Jaccard_Score = round(length(shared) / length(total_unique), 3),
+    Shared_Count = length(shared),
+    Shared_Words = paste(shared, collapse = ", ")
+  )
+}
+```
+
+```{r Jaccard Similarity Coefficient Comparison}
+jaccard_table <- bind_rows(
+  compare_jaccard(deg_chi$Word, deg_mal$Word, "Chinese", "Malay"),
+  compare_jaccard(deg_chi$Word, deg_ind$Word, "Chinese", "Indian"),
+  compare_jaccard(deg_mal$Word, deg_ind$Word, "Malay", "Indian")
+)
+
+kable(jaccard_table, caption = "Table 4: Cross-Cultural Jaccard Similarity Scores")
+```
+
+Since human language network characteristically exhibit a scale-free topology where a small number of words hold the vast majority of connections (Zipf’s Law), a rank-order approach was utilized to identify focal points. For the purposes of this study, the nodes ranking in the top 20 for degree centrality within each demographic network are operationally defined as the structural 'hubs' of the lexicon.
+
+## Rank Shift Analysis
+
+The Jaccard similarity coefficient was applied strictly to the unweighted sets of node labels (the words themselves), rather than the continuous degree scores. This provided a baseline measure of absolute lexical overlap within the top 20 structural hubs of each demographic.
+
+However, to address the limitation of binary overlap and better identify the distinctive anchors within each community, a cross-demographic rank-shift analysis was incorporated. By isolating the shared vocabulary across networks and calculating the difference in degree rank for each word, I identify which specific hubs act as heavily favored anchors in one culture versus another.
+
+Since the network size is vastly different for Chinese, I considered the percentile ranks.
+
+```{r --- fn to compare percentile rank shifts}
+compare_percentile_rank_shifts <- function(g_A, g_B, name_A, name_B) {
+  
+  # 1. Calculate Percentile Ranks for Network A (1.0 is the highest degree)
+  deg_A <- enframe(degree(g_A, mode = "all"), name = "Word", value = "Degree_A") %>%
+    mutate(Percentile_A = percent_rank(Degree_A))
+  
+  # 2. Calculate Percentile Ranks for Network B
+  deg_B <- enframe(degree(g_B, mode = "all"), name = "Word", value = "Degree_B") %>%
+    mutate(Percentile_B = percent_rank(Degree_B))
+  
+  # 3. Join, Filter, and Compare
+  rank_comparison <- full_join(deg_A, deg_B, by = "Word") %>%
+    # Drop words that is only mentioned 1 or 2 times
+    filter(!(Degree_A <= 2 & Degree_B <= 2)) %>%
+    
+    mutate(
+      Percentile_Shift = Percentile_A - Percentile_B,
+      # If Shift is positive, it ranks higher in Group A. 
+      # If Shift is negative, it ranks higher in Group B.
+      # 15% threshold (0.15) to signify meaningful shift
+      Dominant_Group = case_when(
+        Percentile_Shift > 0.15 ~ name_A,
+        Percentile_Shift < -0.15 ~ name_B,
+        TRUE ~ "Shared Equally"
+      )
+    ) %>%
+    # Sort by the most drastic shifts
+    arrange(desc(abs(Percentile_Shift)))
+  
+  return(rank_comparison)
+}
+```
+
+To capture the total cognitive footprint of localized idioms, degree centrality was calculated using `mode = 'all'`, measuring cumulative incoming and outgoing syntactic and semantic traffic.
+
+During the rank-shift analysis, I used a full lexical union (`full_join`) rather than a strict intersection of the demographic vocabularies. Because the Chinese network ($n=474$ participants) functions as a massive lexical superset, restricting the analysis only to shared vocabulary systematically obscured minority anchors. By calculating percentiles across the combined total vocabulary—where unshared words were assigned a degree of zero in the opposing network—I could preserve and highlight the mutually exclusive cultural idioms that define the minority cognitive pathways.
+
+```{r calculate percentile rank shifts}
+percentile_shift_chi_mal <- compare_percentile_rank_shifts(g_chi_hybrid, g_mal_hybrid, "Chinese", "Malay")
+
+percentile_shift_chi_ind <- compare_percentile_rank_shifts(g_chi_hybrid, g_ind_hybrid, "Chinese", "Indian")
+
+percentile_shift_mal_ind <- compare_percentile_rank_shifts(g_mal_hybrid, g_ind_hybrid, "Malay", "Indian")
+
+kable(head(percentile_shift_chi_mal, 15), caption = "Table 5A: Top 15 Distinctive Lexical Anchors Between Chinese and Malay Networks")
+kable(head(percentile_shift_chi_ind, 15), caption = "Table 5B: Top 15 Distinctive Lexical Anchors Between Chinese and Indian Networks")
+kable(head(percentile_shift_mal_ind, 15), caption = "Table 5C: Top 15 Distinctive Lexical Anchors Between Malay and Indian Networks")
+```
+
+## Spearman's Rank Correlation and Anchor Visualisation
+
+To determine if the cognitive networks were fundamentally similar or structurally divergent, a Spearman's rank correlation analysis ($\rho$) was conducted on the degree percentiles of the shared vocabulary across pairwise demographic groups. Because degree centrality in semantic networks is subject to power-law distributions (Zipf's Law), a non-parametric rank correlation isolates the structural prioritization of vocabulary independently of absolute usage volume.
+
+If I had used the classic Pearson correlation, which assumes data is normally distributed and sensitive to outliers, the analysis would have been skewed by the disproportionate influence of a few extremely high-degree nodes (e.g., "not", "damn"). By using Spearman's $\rho$, I can robustly assess whether the relative ranking of shared vocabulary items is preserved across demographics, even if the absolute degree values differ widely.
+
+The scatter plots below visualize this structural alignment. The dashed diagonal line represents theoretical perfect structural agreement. Nodes that deviate significantly from this diagonal indicate distinct cultural anchors—vocabulary items that function as central hubs in one demographic's cognitive map while remaining marginalized in another. By isolating these maximal shifts, I can mathematically confirm the presence of mutually exclusive, demographic-specific syntactic pathways within the broader Singlish lexicon.
+
+```{r --- fn to plot spearman shift}
+plot_spearman_shift <- function(shift_df, name_A, name_B) {
+  
+  spearman_test <- suppressWarnings(
+    cor.test(shift_df$Percentile_A, shift_df$Percentile_B, method = "spearman")
+  )
+  
+  rho_val <- round(spearman_test$estimate, 3)
+  p_val <- signif(spearman_test$p.value, 3)
+  
+  top_A <- shift_df %>%
+    filter(Dominant_Group == name_A) %>%
+    arrange(desc(Percentile_Shift)) %>%
+    slice_head(n = 10) %>%
+    pull(Word)
+  
+  top_B <- shift_df %>%
+    filter(Dominant_Group == name_B) %>%
+    arrange(Percentile_Shift) %>% # Lowest (most negative) shifts
+    slice_head(n = 10) %>%
+    pull(Word)
+  
+  target_anchors <- c(top_A, top_B)
+  
+  plot_data <- shift_df %>%
+    mutate(Label = ifelse(Word %in% target_anchors, Word, ""))
+  
+  # plot
+  p <- ggplot(plot_data, aes(x = Percentile_A, y = Percentile_B, color = Dominant_Group)) +
+    geom_point(alpha = 0.6, size = 2.5) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "darkgray", linewidth = 1) +
+    
+    geom_text_repel(aes(label = Label), size = 4, fontface = "bold", 
+                    box.padding = 0.6, point.padding = 0.3, max.overlaps = Inf, 
+                    show.legend = FALSE, min.segment.length = 0, seed = 42) +
+    
+    scale_color_manual(values = setNames(c("#E69F00", "#56B4E9", "#999999"), 
+                                         c(name_A, name_B, "Shared Equally"))) +
+    
+    scale_x_continuous(limits = c(-0.05, 1.05), expand = c(0, 0)) +
+    scale_y_continuous(limits = c(-0.05, 1.05), expand = c(0, 0)) +
+    
+    theme_minimal(base_size = 14) +
+    labs(
+      title = paste("Cognitive Hub Alignment:", name_A, "vs", name_B),
+      subtitle = paste0("Spearman's \u03c1 = ", rho_val, " (p = ", p_val, ")"),
+      x = paste(name_A, "Degree Percentile"),
+      y = paste(name_B, "Degree Percentile"),
+      color = "Dominant Anchor"
+    ) +
+    theme(legend.position = "bottom")
+  
+  # print stats
+  cat(sprintf("\n\n#### %s vs %s \n", name_A, name_B))
+  cat(sprintf("**Spearman's rho (ρ):** %s \n\n", rho_val))
+  cat(sprintf("**p-value:** %s \n\n", p_val))
+  
+  if (p_val < 0.05) {
+    cat("**STATISTICAL SIGNIFICANCE:** YES (p < 0.05) \n\n")
+    if (rho_val > 0.7) {
+      cat("**CONCLUSION:** Highly Similar. The core cognitive maps are nearly identical.\n\n")
+    } else if (rho_val > 0.4) {
+      cat("**CONCLUSION:** Moderately Similar. They share a foundation, but have distinct cultural variations.\n\n")
+    } else {
+      cat("**CONCLUSION:** Weakly Similar. Despite sharing vocabulary, their structural hubs are vastly different.\n\n")
+    }
+  } else {
+    cat("**STATISTICAL SIGNIFICANCE:** NO (p > 0.05) \n\n")
+    cat("**CONCLUSION:** Completely Divergent. There is no statistically significant relationship between how these two cultures rank their Singlish hubs.\n\n")
+  }
+  
+  return(p)
+}
+
+```
+
+```{r calculating and plotting spearman shifts, results='asis'}
+plot_chi_mal <- plot_spearman_shift(percentile_shift_chi_mal, "Chinese", "Malay")
+print(plot_chi_mal)
+
+plot_chi_ind <- plot_spearman_shift(percentile_shift_chi_ind, "Chinese", "Indian")
+print(plot_chi_ind)
+
+plot_mal_ind <- plot_spearman_shift(percentile_shift_mal_ind, "Malay", "Indian")
+print(plot_mal_ind)
+```
